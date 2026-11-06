@@ -1,6 +1,6 @@
 #include "algorithm_ctrl.h"
 #include "gait_phase.h"
-
+#include <math.h>
 
 
 /* ------------------- Default Variables ------------------ */
@@ -73,6 +73,8 @@ float f_vector_input_RH = 0.0f;
 float f_vector_input_LH = 0.0f;
 
 float assist_level = 1.0f;
+float CalculateAutoAssistGain(float asym);
+float CalculatePersonalImprovement(float off, float current);
 /* -------------------------------------------------------- */
 
 /* -------------------- STATE FUNCTION -------------------- */
@@ -195,6 +197,33 @@ volatile float   split_asym       = 0.0f;   /* 관찰용: 걸음마다 갱신되
 volatile float   assist_sym_ref   = -0.04f; /* 이 사람의 정상(0 kg) 값. 0 kg 걸을 때 split_asym 을 보고 넣기 */
 volatile float   assist_k_dur     = 2.0f;   /* 비대칭 0.1 당 보조 길이 +20 % (0 이면 끔) */
 volatile float   assist_k_gain    = 0.0f;   /* 비대칭 0.1 당 세기 +k*10 % (기본 0: 세기는 손으로 정함) */
+/* 개인별 보조 OFF 기준 측정 */
+volatile uint8_t baseline_collect = 0;
+volatile uint8_t baseline_ready = 0;
+volatile uint32_t baseline_count = 0;
+volatile float baseline_mean = 0.0f;
+/* 보조 전후 비대칭 비교 */
+volatile float asym_current = 0.0f; //현재 측정된 비대칭
+volatile float asym_improvement = 0.0f; //	OFF 기준 대비 개선율(%)
+volatile float personal_improvement = 0.0f;
+volatile uint8_t personal_recommend_status = 0;
+/* 보조 ON 상태 비대칭 측정 */
+volatile uint8_t on_collect = 0;
+volatile uint8_t on_ready = 0;
+volatile uint32_t on_count = 0;
+volatile float on_mean = 0.0f;
+
+/* OFF 대비 ON 비대칭 개선율 */
+volatile float on_improvement = 0.0f;
+/* 자동 보조 강도 추천 - 모터 출력과 연결하지 않음 */
+volatile float assist_recommended_Nm = 0.0f; //알고리즘이 추천하는 보조 강도
+volatile float assist_target_improvement = 30.0f; //목표 비대칭 감소율 30%
+volatile uint8_t assist_recommend_status = 0; //추천 결과 상태
+/* 추천 알고리즘 테스트 결과 */
+volatile float recommend_test_improvement = 0.0f;
+volatile uint8_t recommend_test_status = 0;
+volatile float recommend_test_Nm = 0.0f;
+/**/
 volatile float   assist_dur_eff_ms = 0.0f, assist_gain_eff = 0.0f;  /* 관찰용: 실제 적용된 길이/세기 */
 static float    sp_hi = -1.0e9f, sp_lo = 1.0e9f;
 static int8_t   sp_state = 0;
@@ -205,6 +234,71 @@ static uint8_t  asym_init = 0;
 /*---------- (1) END of STUDENT CODE (Declare the functions to use) -------------*/
 
 DOP_COMMON_SDO_CB(algorithmCtrlTask)
+
+void TestAssistRecommendation(void)
+{
+    /* 이전 실험 데이터 */
+    float off = 0.454f;
+    float on = 0.142f;
+    float test_gain = 5.0f;
+
+    float target = assist_target_improvement;
+
+    recommend_test_improvement =
+        (fabsf(off) - fabsf(on)) / fabsf(off) * 100.0f;
+
+    recommend_test_status = 0;
+    recommend_test_Nm = 0.0f;
+
+    if (recommend_test_improvement >= target)
+    {
+        /* 목표 달성: 현재 강도 유지 후보 */
+        recommend_test_Nm = test_gain;
+        recommend_test_status = 1;
+    }
+    else if (recommend_test_improvement >= 0.0f)
+    {
+        /* 목표 미달: 새로운 강도 자동 결정 보류 */
+        recommend_test_Nm = 0.0f;
+        recommend_test_status = 2;
+    }
+    else
+    {
+        /* 악화: 강도 증가 추천 금지 */
+        recommend_test_Nm = 0.0f;
+        recommend_test_status = 3;
+    }
+}
+
+/* 실시간 비대칭 기반 보조 강도 추천 */
+float CalculateAutoAssistGain(float asym)
+{
+    float a = fabsf(asym);
+
+    float ratio = (a - 0.10f) / 0.35f;
+
+    if (ratio < 0.0f) ratio = 0.0f;
+    if (ratio > 1.0f) ratio = 1.0f;
+
+    return 3.0f + 2.0f * ratio;
+}
+
+/* 개인별 기준 대비 개선율 계산 */
+float CalculatePersonalImprovement(float off, float current)
+{
+    float ref = fabsf(off);
+
+    if (ref <= 0.01f)
+        return 0.0f;
+
+    return (ref - fabsf(current)) / ref * 100.0f;
+}
+
+/* 테스트 결과를 Live Expressions에서 확인하기 위한 함수 */
+void RunAssistRecommendationTest(void)
+{
+    TestAssistRecommendation();
+}
 
 void InitAlgorithmCtrl(void)
 {
@@ -444,6 +538,7 @@ static void StateEnable_Run(void)
 		gait_phase_init(&gpLH, 1.0f / DT);
 		gpLH.min_amp_deg = 2.0f;   /* 작은 보폭에서도 valid (기본 3 deg) */
 		gpInited = true;
+		TestAssistRecommendation(); /* 가상 데이터로 추천 알고리즘 1회 테스트 */
 	}
 
 	gait_phase_update(&gpRH, robotDataObj_RH.thighTheta_act);
@@ -547,6 +642,117 @@ static void StateEnable_Run(void)
 								float A = (sp_hi + sp_lo) / rng;
 								split_asym = asym_init ? (0.7f * split_asym + 0.3f * A) : A;
 								asym_init = 1;
+								/* 개인별 OFF 기준 대비 현재 개선율 */
+								if (baseline_ready == 1 &&
+								    baseline_count == 10 &&
+								    fabsf(baseline_mean) > 0.01f)
+								{
+								    personal_improvement =
+								        CalculatePersonalImprovement(
+								            baseline_mean,
+								            split_asym
+								        );
+								    /* 개인별 개선율에 따른 추천 상태 */
+								    if (personal_improvement >= assist_target_improvement)
+								    {
+								        personal_recommend_status = 1;
+								    }
+								    else if (personal_improvement >= 0.0f)
+								    {
+								        personal_recommend_status = 2;
+								    }
+								    else
+								    {
+								        personal_recommend_status = 3;
+								    }
+								}
+								/* 개인 기준 측정 완료 후 자동 추천값 갱신 */
+								if (baseline_ready == 1)
+								{
+								    assist_recommended_Nm =
+								        CalculateAutoAssistGain(split_asym);
+								}
+								/* 개인별 OFF 기준 대비 비대칭 개선율 */
+								if (baseline_ready == 1 && baseline_collect == 0)
+								{
+								    asym_current = split_asym;
+
+								    float ref = fabsf(baseline_mean);
+
+								    if (ref > 0.01f)
+								    {
+								        asym_improvement =
+								            (ref - fabsf(asym_current)) / ref * 100.0f;
+								    }
+								    else
+								    {
+								        asym_improvement = 0.0f;
+								    }
+								}
+								/* 보조 OFF 상태에서 개인별 비대칭 기준값 수집 */
+								if (baseline_collect == 1 && assist_on == 0 && baseline_ready == 0)
+								{
+								    baseline_count++;
+
+								    baseline_mean += (A - baseline_mean) / (float)baseline_count;
+
+								    if (baseline_count >= 10)
+								    {
+								        baseline_ready = 1;
+								        baseline_collect = 0;
+								    }
+								}
+								/* 보조 ON 상태에서 10주기 평균 측정 */
+								if (on_collect == 1 &&
+								    baseline_ready == 1 &&
+								    assist_on == 1 &&
+								    on_ready == 0)
+								{
+								    on_count++;
+
+								    on_mean += (A - on_mean) / (float)on_count;
+
+								    if (on_count >= 10)
+								    {
+								        on_ready = 1;
+								        on_collect = 0;
+
+								        float ref = fabsf(baseline_mean);
+
+								        if (ref > 0.01f)
+								        {
+								            on_improvement =
+								                (ref - fabsf(on_mean)) / ref * 100.0f;
+								        }
+								        else
+								        {
+								            on_improvement = 0.0f;
+								        }
+								        /* 자동 보조 강도 추천 상태 계산 */
+								        assist_recommended_Nm = 0.0f;
+								        assist_recommend_status = 0;
+
+								        if (ref > 0.01f)
+								        {
+								            if (on_improvement >= assist_target_improvement)
+								            {
+								                /* 목표 개선율 달성 */
+								                assist_recommended_Nm = assist_gain_Nm;
+								                assist_recommend_status = 1;
+								            }
+								            else if (on_improvement >= 0.0f)
+								            {
+								                /* 개선됐지만 목표 미달 */
+								                assist_recommend_status = 2;
+								            }
+								            else
+								            {
+								                /* 비대칭 악화 */
+								                assist_recommend_status = 3;
+								            }
+								        }
+								    }
+								}
 							}
 							sp_hi = -1.0e9f;  sp_lo = 1.0e9f;
 						}
